@@ -1,0 +1,17 @@
+[package]
+name = "teras_uci"
+authors = ["Gabriel Piveta"]
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+teras_engine = { path = "../engine" }
+dama = { path = "../../dama" }
+anyhow = "1.0.98"
+thiserror = "2.0.12"
