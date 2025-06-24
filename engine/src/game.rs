@@ -43,7 +43,7 @@ impl Game {
 
     pub(crate) fn with_nnue(mut self, transformer: &nnue::Transformer) -> Self {
         self.transformer = Some(transformer.clone());
-        self.accumulators.push(nnue::Accumulator::from_position(transformer, &self.position()));
+        self.accumulators.push(nnue::Accumulator::from_position(transformer, self.position()));
         self
     }
 
@@ -68,11 +68,27 @@ impl Game {
 
     #[inline]
     pub fn previous_move(&self) -> Option<Move> {
-        self.moves.last().copied().flatten()
+        self.moves.last().and_then(|m| *m)
     }
 
     #[inline]
-    pub fn play(&mut self, mv: &Move) {
+    pub fn visit_skip<T>(&mut self, mut f: impl FnMut(&mut Game) -> T) -> T {
+        self.skip();
+        let value = f(self);
+        self.undo();
+        value 
+    }
+
+    #[inline]
+    pub fn visit<T>(&mut self, mv: &Move, mut f: impl FnMut(&mut Game) -> T) -> T {
+        self.play(&mv);
+        let value = f(self);
+        self.undo();
+        value 
+    }
+
+    #[inline]
+    fn play(&mut self, mv: &Move) {
         if let Some(transformer) = &self.transformer {
             self.accumulators.push(
                 self.accumulators
@@ -99,7 +115,7 @@ impl Game {
     }
 
     #[inline]
-    pub fn skip(&mut self) {
+    fn skip(&mut self) {
         if self.transformer.is_some() {
             self.accumulators.push(
                 self.accumulators
@@ -116,20 +132,16 @@ impl Game {
 
     #[inline]
     pub fn undo(&mut self) {
-        if self.accumulators.len() > 1 {
-            self.accumulators.pop();
-        }
         if self.positions.len() > 1 {
             self.positions.pop();
         }
+        self.accumulators.pop();
         self.moves.pop();
     }
 
     #[inline]
     pub fn is_draw(&self) -> bool {
-        self.position().halfmove_clock() >= 100
-            || self.repetitions() >= 2
-            || self.position().is_insufficient_material()
+        self.position().halfmove_clock() >= 100 || self.repetitions() >= 2
     }
 
     #[inline]

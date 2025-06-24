@@ -1,7 +1,7 @@
 use arrayvec::ArrayVec;
-use dama::{MAX_LEGAL_MOVES, Move, MoveList, Position};
-use crate::utils::{see::see, values};
-use super::history::Histories;
+use dama::{MAX_LEGAL_MOVES, Move, MoveList};
+use crate::{game::Game, utils::{see::see, values}};
+use super::history::History;
 
 pub struct OrderedMoves {
     current: usize,
@@ -10,9 +10,9 @@ pub struct OrderedMoves {
 }
 
 pub struct OrderingContext<'a, 'b> {
-    pub position: &'a Position,
+    pub game: &'a Game,
     pub killers: &'b [Move],
-    pub histories: &'b Histories,
+    pub history: &'b History,
     pub hash_move: Option<Move>,
 }
 
@@ -34,17 +34,17 @@ impl OrderedMoves {
 
     #[inline]
     fn score(ctx: &OrderingContext, mv: Move) -> i32 {
+        let position = ctx.game.position();
         if ctx.hash_move == Some(mv) {
             HASH_MOVE
-        } else if ctx.position.is_capture(&mv) || mv.promotion().is_some() {
-            let moved = ctx
-                .position
+        } else if position.is_capture(&mv) || mv.promotion().is_some() {
+            let moved = position
                 .piece_at(mv.from)
                 .expect("No piece to be moved");
-            let captured = ctx.position.piece_at(mv.to);
+            let captured = position.piece_at(mv.to);
             let promotion = mv.promotion();
             if promotion.is_none() {
-                let see = see(&ctx.position, &mv);
+                let see = see(&position, &mv);
                 if see >= 0 {
                     GOOD_CAPTURE_OR_PROMOTION 
                         + captured.map(values::piece).unwrap_or(0) * 10
@@ -61,7 +61,7 @@ impl OrderedMoves {
         } else if ctx.killers.contains(&mv) {
             KILLER_MOVE
         } else {
-            QUIET_MOVE + ctx.histories.get(&ctx.position, &mv)
+            QUIET_MOVE + ctx.history.get(&position, &mv)
         }
     }
 

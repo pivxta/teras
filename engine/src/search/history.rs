@@ -1,16 +1,15 @@
 use super::Node;
-use dama::{ByColor, ByPiece, BySquare, Color, Move, Piece, Position, Square};
+use dama::{ByColor, ByPiece, BySquare, Move, Position};
 
 pub const HISTORY_LIMIT: i32 = 8192;
 pub const HISTORY_BONUS_MULTIPLIER: i32 = 8;
-pub const HISTORY_AGE_DIVISOR: i32 = 128;
 
 #[derive(Clone, Debug, Default)]
-pub struct Histories {
-    history: Box<ByColor<ByPiece<BySquare<i32>>>>,
+pub struct History {
+    history: Box<ByColor<ByPiece<BySquare<Value>>>>,
 }
 
-impl Histories {
+impl History {
     #[inline]
     pub fn clear(&mut self) {
         self.history = Default::default();
@@ -19,7 +18,7 @@ impl Histories {
     #[inline]
     pub fn get(&self, position: &Position, mv: &Move) -> i32 {
         let moved = position.piece_at(mv.from).expect("no piece to be moved");
-        self.history[position.side_to_move()][moved][mv.to]
+        self.history[position.side_to_move()][moved][mv.to].0
     }
 
     #[inline]
@@ -28,10 +27,7 @@ impl Histories {
         let moved = position.piece_at(mv.from).expect("no piece to be moved");
         let value = &mut self.history[color][moved][mv.to];
 
-        let bonus = HISTORY_BONUS_MULTIPLIER * (node.depth * node.depth) as i32;
-        let bonus = bonus - bonus.saturating_mul(*value) / HISTORY_LIMIT;
-
-        *value = (*value + bonus).min(HISTORY_LIMIT);
+        value.update(HISTORY_BONUS_MULTIPLIER * (node.depth * node.depth) as i32);
     }
 
     #[inline]
@@ -40,9 +36,16 @@ impl Histories {
         let moved = position.piece_at(mv.from).expect("no piece to be moved");
         let value = &mut self.history[color][moved][mv.to];
 
-        let penalty = HISTORY_BONUS_MULTIPLIER * (node.depth * node.depth) as i32;
-        let penalty = penalty + penalty.saturating_mul(*value) / HISTORY_LIMIT;
+        value.update(-HISTORY_BONUS_MULTIPLIER * (node.depth * node.depth) as i32);
+    }
+}
 
-        *value = (*value - penalty).max(-HISTORY_LIMIT);
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Value(i32);
+
+impl Value {
+    fn update(&mut self, bonus: i32) {
+        self.0 += bonus - bonus.abs() * self.0 / HISTORY_LIMIT;
+        self.0 = self.0.clamp(-HISTORY_LIMIT, HISTORY_LIMIT);
     }
 }

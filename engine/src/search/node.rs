@@ -27,7 +27,6 @@ pub struct Node {
     pub kind: NodeKind,
     pub depth: u32,
     pub ply: u32,
-    pub allow_null: bool,
 }
 
 impl Node {
@@ -37,7 +36,6 @@ impl Node {
             kind: NodeKind::Pv,
             depth,
             ply: 0,
-            allow_null: true,
         }
     }
 
@@ -46,7 +44,6 @@ impl Node {
         Node {
             kind,
             ply: self.ply + 1,
-            allow_null: true,
             depth: self.depth.saturating_sub(1),
         }
     }
@@ -75,12 +72,6 @@ impl Node {
     #[inline]
     pub fn reduce(mut self, reduction: u32) -> Node {
         self.depth = self.depth.saturating_sub(reduction);
-        self
-    }
-
-    #[inline]
-    pub fn allow_null(mut self, allow_null: bool) -> Node {
-        self.allow_null = allow_null;
         self
     }
 

@@ -6,25 +6,22 @@ mod node;
 mod order;
 mod time;
 mod window;
+mod params;
 
 use crate::{
-    eval::{Bound, Eval}, game::Game, nnue, psqt
+    eval::{Bound, Eval}, game::Game, nnue, psqt, utils::see::see
 };
 use cache::CacheTable;
 use dama::{ByColor, Move, MoveList, Position};
-use history::Histories;
+use history::History;
 use killers::Killers;
 use line::Line;
 use node::{Node, NodeKind};
 use order::{OrderedMoves, OrderingContext};
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    array, sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc,
+    }, thread::{self, JoinHandle}, time::{Duration, Instant}
 };
 use thiserror::Error;
 use time::Time;
@@ -156,6 +153,8 @@ pub enum Error {
     InvalidThreadCount,
     #[error("hash size cannot be 0")]
     InvalidCacheSize,
+    #[error("engine is already busy")]
+    Busy
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -300,13 +299,6 @@ impl Engine {
         self.eval_mode = eval_mode;
     }
 
-    pub fn reset(&self) {
-        for (_, jobs) in &self.threads {
-            jobs.send(Job::Reset).expect("search thread terminated before expected");
-        }
-        self.cache.clear();
-    }
-
     pub fn eval(&self, position: &Position, eval_mode: EvalMode) -> Eval {
         match eval_mode {
             EvalMode::Psqt => psqt::evaluate(position),
@@ -317,9 +309,24 @@ impl Engine {
         }
     }
 
-    pub fn search(&mut self, game: &Game, mut options: SearchOptions) {
+    pub fn reset(&self) -> Result<(), Error> {
         if self.shared.running() {
-            return;
+            eprintln!("search call");
+            return Err(Error::Busy);
+        }
+
+        for (_, jobs) in &self.threads {
+            jobs.send(Job::Reset)
+                .expect("search thread terminated before expected");
+        }
+
+        Ok(())
+    }
+
+    pub fn search(&mut self, game: &Game, mut options: SearchOptions) -> Result<(), Error> {
+        if self.shared.running() {
+            eprintln!("search call");
+            return Err(Error::Busy);
         }
         self.shared.start();
         self.cache.age();
@@ -347,6 +354,8 @@ impl Engine {
             }))
             .expect("search thread terminated before expected");
         }
+
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -404,13 +413,52 @@ struct Thread {
     nodes: u64,
 
     killers: Killers,
-    histories: Histories,
+    history: History,
+
+    lmr_table: [[i32; 64]; 64]
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchInterrupted;
 
 impl Thread {
+    fn new(
+        kind: ThreadKind, 
+        shared: Arc<Shared>, 
+        cache: CacheTable, 
+        model: nnue::Model, 
+        transformer: nnue::Transformer
+    ) -> Self {
+        Self {
+            kind,
+            cache,
+            shared,
+            model,
+            transformer,
+
+            root_moves: Default::default(),
+            eval_mode: Default::default(),
+            max_depth: Default::default(),
+            max_nodes: Default::default(),
+            time: Default::default(),
+            nodes: Default::default(),
+            start: Instant::now(),
+
+            killers: Default::default(),
+            history: Default::default(),
+
+            lmr_table: array::from_fn(|depth| array::from_fn(|num| {
+                if depth == 0 {
+                    return 0;
+                }
+
+                let depth = depth as f32;
+                let num = num as f32 + 1.0;
+                (0.5 + depth.ln() * num.ln() / 2.25) as i32
+            }))
+        }
+    }
+
     fn do_job(&mut self, job: Job) {
         match job {
             Job::Search(job) => self.do_search_job(job),
@@ -426,23 +474,24 @@ impl Thread {
         self.model = job.model;
         self.transformer = job.transformer;
         self.eval_mode = job.eval_mode;
-        self.root_moves = job.moves_to_search.into_iter().collect();
         self.max_depth = job.max_depth;
         self.max_nodes = job.max_nodes;
         self.time = Time::new(job.game.position().side_to_move(), job.time);
+        if job.moves_to_search.is_empty() {
+            self.root_moves = job.game.position().legal_moves();
+        } else {
+            self.root_moves = job.moves_to_search.into_iter().collect();
+        }
         self.iterative_deepening(
             job.game, 
             job.on_depth_finished, 
             job.on_search_finished
         );
-        if self.kind == ThreadKind::Main {
-            self.shared.stop();
-        }
     }
     
     fn reset(&mut self) {
         self.killers.clear();
-        self.histories.clear();
+        self.history.clear();
     }
 
     fn iterative_deepening(
@@ -451,15 +500,10 @@ impl Thread {
         mut on_depth_finished: Option<OnDepthFinished>,
         on_search_finished: Option<OnSearchFinished>,
     ) {
-        let position = game.position().clone();
         let mut game = match self.eval_mode {
             EvalMode::Nnue => game.with_nnue(&self.transformer),
             EvalMode::Psqt => game
         };
-
-        if self.root_moves.is_empty() {
-            self.root_moves = game.position().legal_moves();
-        }
 
         let mut last_depth = 0;
         let mut last_eval = None;
@@ -468,7 +512,7 @@ impl Thread {
             None => Line::new(),
         };
 
-        const ASPIRATION_WINDOW: i32 = 20;
+        const ASPIRATION_WINDOW: i32 = 15;
         'iterative_deepening: for depth in 1..=self.max_depth {
             let mut delta = ASPIRATION_WINDOW;
             let mut window = if depth <= 3 {
@@ -484,26 +528,32 @@ impl Thread {
                 };
 
                 delta += delta / 2;
-                if eval <= window.alpha {
-                    window.beta = window.alpha.average(window.beta);
-                    window.alpha -= delta;
-                    if let Some(on_depth_finished) = &mut on_depth_finished {
-                        on_depth_finished(&position, self.search_info(depth, eval, Bound::Upper, &pv));
-                    }
-                } else if eval >= window.beta {
-                    window.beta += delta;
-                    if let Some(on_depth_finished) = &mut on_depth_finished {
-                        on_depth_finished(&position, self.search_info(depth, eval, Bound::Lower, &pv));
-                    }
-                } else {
-                    if let Some(on_depth_finished) = &mut on_depth_finished {
-                        on_depth_finished(&position, self.search_info(depth, eval, Bound::Exact, &pv));
-                    }
 
-                    last_depth = depth;
-                    last_eval = Some(eval);
-                    last_pv = pv;
-                    break;
+                let bound = if eval <= window.alpha {
+                    Bound::Upper
+                } else if eval >= window.beta {
+                    Bound::Lower
+                } else {
+                    Bound::Exact
+                };
+
+                if let Some(send_info) = &mut on_depth_finished {
+                    send_info(&game.position(), self.search_info(depth, eval, bound, &pv));
+                }
+
+                last_depth = depth;
+                last_eval = Some(eval);
+                last_pv = pv;
+
+                match bound {
+                    Bound::Upper => {
+                        window.beta = window.alpha.average(window.beta);
+                        window.alpha -= delta;
+                    }
+                    Bound::Lower => {
+                        window.beta += delta; 
+                    }
+                    _ => break
                 }
             }
             if self.start.elapsed() >= self.time.soft_limit {
@@ -511,10 +561,19 @@ impl Thread {
             }
         }
 
+        if self.kind == ThreadKind::Main {
+            self.shared.stop();
+        }
+
         if let Some(on_search_finished) = on_search_finished {
             on_search_finished(
-                &position,
-                self.search_info(last_depth, last_eval.unwrap_or(Eval::ZERO), Bound::Exact, &last_pv),
+                &game.position(),
+                self.search_info(
+                    last_depth, 
+                    last_eval.unwrap_or(Eval::ZERO), 
+                    Bound::Exact, 
+                    &last_pv
+                ),
             );
         }
     }
@@ -538,7 +597,7 @@ impl Thread {
     fn search(
         &mut self,
         game: &mut Game,
-        node: Node,
+        mut node: Node,
         mut window: Window,
         pv: &mut Line,
     ) -> Result<Eval, SearchInterrupted> {
@@ -553,8 +612,16 @@ impl Thread {
         self.add_node();
         pv.clear();
 
-        if !node.is_root() && game.is_draw() {
-            return Ok(Eval::DRAW);
+        if !node.is_root() {
+            if game.is_draw() {
+                return Ok(Eval::DRAW);
+            }
+
+            window.alpha = window.alpha.max(Eval::mated_in(node.ply));
+            window.beta = window.beta.min(Eval::mate_in(node.ply));
+            if window.alpha >= window.beta {
+                return Ok(window.alpha)
+            }
         }
 
         let in_check = game.position().is_in_check();
@@ -562,6 +629,20 @@ impl Thread {
         let hash_entry = self.cache.load(game.position(), &node);
         let hash_move = hash_entry.and_then(|e| e.best);
 
+        let mut static_eval = if !in_check {
+            self.evaluate(game)
+        } else {
+            Eval::mated_in(node.ply)
+        };
+
+        if let Some(hash_entry) = hash_entry {
+            static_eval = match hash_entry.bound {
+                Bound::Exact => hash_entry.eval,
+                Bound::Lower => hash_entry.eval.max(static_eval),
+                Bound::Upper => hash_entry.eval.min(static_eval),
+            };
+        }
+        
         if !node.is_pv() {
             if let Some(hash_entry) = hash_entry.filter(|e| e.depth >= node.depth) {
                 match hash_entry.bound {
@@ -572,22 +653,25 @@ impl Thread {
                 }
             }
 
+            let margin = node.depth as i32 * 100;
+            if !in_check && static_eval >= window.beta + margin {
+                return Ok(static_eval.average(window.beta));
+            }
+
             if !in_check
-                && node.allow_null
-                && node.depth >= 3 
+                && node.depth >= 2 
                 && node.is_cut() 
+                && static_eval >= window.beta
                 && game.position().has_non_pawn_material(game.position().side_to_move())
             {
-                let reduction = 2 + node.depth / 4;
+                let reduction = 2 + node.depth / 5;
 
-                game.skip();
-                let eval = -self.search(
+                let eval = game.visit_skip(|game| self.search(
                     game, 
-                    node.child(NodeKind::Cut).allow_null(false).reduce(reduction), 
+                    node.child(NodeKind::Cut).reduce(reduction), 
                     -window.null_beta(), 
                     pv
-                )?;
-                game.undo();
+                ).map(|eval| -eval))?;
 
                 if eval >= window.beta {
                     return Ok(eval);
@@ -595,10 +679,15 @@ impl Thread {
             }
         }
 
+        if hash_move.is_none() && node.depth >= 7 && (node.is_pv() || node.is_cut()) {
+            node.depth -= 1;
+        }
+
         let mut sub_line = Line::new();
         let mut quiets = MoveList::new();
+        let mut quiets_tried = 0;
         let moves = OrderedMoves::new(
-            self.ordering_context(&node, game.position(), hash_move),
+            self.ordering_context(game, &node, hash_move),
             if node.is_root() {
                 self.root_moves.clone()
             } else {
@@ -613,26 +702,81 @@ impl Thread {
             Eval::DRAW
         };
 
+        let reduction_first = if node.is_root() { 3 } else { 1 };
+
         for (n, mv) in moves.enumerate() {
-            game.play(&mv);
+            let is_quiet = game.position().is_quiet(&mv);
+
+            if is_quiet
+                && !node.is_pv() 
+                && node.depth <= 2 
+                && quiets_tried >= 5 + node.depth * node.depth 
+            {
+                continue;    
+            }
 
             let mut child_node = match node.kind { 
                 NodeKind::Pv if n == 0 => NodeKind::Pv,
                 NodeKind::Cut if n == 0 => NodeKind::All,
-                NodeKind::Pv | NodeKind::Cut | NodeKind::All => NodeKind::Cut,
+                _ => NodeKind::Cut,
             };
             let child_window = match child_node {
                 NodeKind::Pv => window,
                 _ => window.null_alpha()
             };
+            
+            let reduction = if n >= reduction_first && node.depth >= 3 {
+                let mut reduction = self.lmr(&node, n);
+                if node.is_pv() {
+                    reduction -= 1;
+                }
+                if node.is_cut() {
+                    reduction += 1;
+                }
+                if self.killers.get(&node).contains(&mv) {
+                    reduction -= 1;
+                }
+                reduction.max(0) as u32
+            } else {
+                0
+            };
 
-            let mut eval = -self.search(game, node.child(child_node), -child_window, &mut sub_line)?;
-            if !child_node.is_pv() && window.contains(eval) {
-                child_node = NodeKind::Pv;
-                eval = -self.search(game, node.child(child_node), -window, &mut sub_line)?;
-            }
+            let eval = game.visit(&mv, |game| {
+                let gives_check = game.position().is_in_check();
+                let extension = if gives_check {
+                    1
+                } else {
+                    0
+                };
 
-            game.undo();
+                let mut eval = -self.search(
+                    game, 
+                    node.child(child_node).extend(extension).reduce(reduction), 
+                    -child_window, 
+                    &mut sub_line
+                )?;
+
+                if reduction > 0 && eval > window.alpha {
+                    eval = -self.search(
+                        game, 
+                        node.child(child_node).extend(extension), 
+                        -child_window, 
+                        &mut sub_line
+                    )?;
+                }
+
+                if node.is_pv() && !child_node.is_pv() && eval > window.alpha {
+                    child_node = NodeKind::Pv;
+                    eval = -self.search(
+                        game, 
+                        node.child(child_node).extend(extension), 
+                        -window, 
+                        &mut sub_line
+                    )?;
+                }
+
+                Ok(eval)
+            })?;
 
             if eval > best_eval {
                 best_move = Some(mv);
@@ -646,17 +790,18 @@ impl Thread {
                 if best_eval >= window.beta {
                     if game.position().is_quiet(&mv) {
                         self.killers.add(&node, mv);
-                        self.histories.bonus(game.position(), &node, &mv);
+                        self.history.bonus(game.position(), &node, &mv);
                         for quiet in quiets {
-                            self.histories.penalty(game.position(), &node, &quiet);
+                            self.history.penalty(game.position(), &node, &quiet);
                         }
                     }
                     break;
                 }
             }
 
-            if game.position().is_quiet(&mv) {
+            if is_quiet {
                 quiets.push(mv);
+                quiets_tried += 1;
             }
         }
 
@@ -694,6 +839,10 @@ impl Thread {
         self.add_node();
         pv.clear();
 
+        if game.is_draw() {
+            return Ok(Eval::DRAW);
+        }
+
         let in_check = game.position().is_in_check();
         let mut best_eval = if !in_check {
             self.evaluate(game)
@@ -709,19 +858,29 @@ impl Thread {
         }
 
         let mut sub_line = Line::new();
+        //let hash_entry = self.cache.load(game.position(), &node);
+        //let hash_move = hash_entry.and_then(|e| e.best);
+        //let mut best_move = None;
+
         let moves = if !in_check {
             game.position().legal_captures()
         } else {
             game.position().legal_moves()
         };
 
-        for mv in OrderedMoves::new(self.ordering_context(&node, game.position(), None), moves) {
-            game.play(&mv);
-            let eval = -self.search(game, node.child(NodeKind::Pv), -window, &mut sub_line)?;
-            game.undo();
+        for mv in OrderedMoves::new(self.ordering_context(game, &node, None), moves) {
+            if !in_check && see(game.position(), &mv) < 0 {
+                continue;
+            }
+
+            let eval = game.visit(&mv, |game| {
+                self.search(game, node.child(NodeKind::Pv), -window, &mut sub_line)
+                    .map(|eval| -eval)
+            })?;
 
             if eval > best_eval {
                 best_eval = eval;
+                //best_move = Some(mv);
                 pv.set(mv, &sub_line);
                 if best_eval > window.alpha {
                     window.alpha = best_eval;
@@ -731,6 +890,25 @@ impl Thread {
                 }
             }
         }
+
+        /*
+        self.cache.store(
+            game.position(),
+            &node,
+            cache::Entry {
+                depth: 0,
+                best: best_move,
+                eval: best_eval,
+                bound: if best_eval <= window.alpha {
+                    Bound::Upper
+                } else if best_eval >= window.beta {
+                    Bound::Lower
+                } else {
+                    Bound::Exact
+                },
+            },
+        );
+*/
 
         Ok(best_eval)
     }
@@ -747,16 +925,20 @@ impl Thread {
         }
     }
 
+    fn lmr(&self, node: &Node, n: usize) -> i32 {
+        self.lmr_table[node.depth.min(63) as usize][n.min(63)]
+    }
+
     fn ordering_context<'a>(
         &self,
+        game: &'a Game,
         node: &Node,
-        position: &'a Position,
         hash_move: Option<Move>,
     ) -> OrderingContext<'a, '_> {
         OrderingContext {
+            game,
             hash_move,
-            position,
-            histories: &self.histories,
+            history: &self.history,
             killers: self.killers.get(node),
         }
     }
@@ -771,7 +953,7 @@ impl Thread {
             return true;
         }
 
-        const NODES_PER_TIME_CHECK: u64 = 256;
+        const NODES_PER_TIME_CHECK: u64 = 128;
         if self.kind == ThreadKind::Main
             && self.nodes % NODES_PER_TIME_CHECK == 0
             && (self.shared.nodes_searched() >= self.max_nodes || self.time_is_over())
@@ -796,24 +978,7 @@ fn search_thread(
     shared: Arc<Shared>,
     jobs: mpsc::Receiver<Job>,
 ) {
-    let mut thread = Thread {
-        kind,
-        cache,
-        shared,
-        model,
-        transformer,
-
-        root_moves: Default::default(),
-        eval_mode: Default::default(),
-        max_depth: Default::default(),
-        max_nodes: Default::default(),
-        time: Default::default(),
-        nodes: Default::default(),
-        start: Instant::now(),
-
-        killers: Default::default(),
-        histories: Default::default()
-    };
+    let mut thread = Thread::new(kind, shared, cache, model, transformer);
     for job in jobs {
         thread.do_job(job);
     }

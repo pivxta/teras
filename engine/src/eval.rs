@@ -65,6 +65,11 @@ impl Eval {
     }
 
     #[inline]
+    pub const fn is_mated(self) -> bool {
+        self.0 < Self::MIN_CENTIPAWNS
+    }
+
+    #[inline]
     pub const fn plies_from_mate(self) -> Option<u32> {
         let abs = self.0.abs();
         if abs > Self::MAX_CENTIPAWNS {

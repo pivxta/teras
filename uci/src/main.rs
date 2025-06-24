@@ -58,13 +58,13 @@ impl Uci {
                 self.game = Game::from_position(initial_pos).with_moves(&moves)?;
             },
             Command::Go(go) => {
-                self.engine.search(&self.game, self.search_options(go)?);
+                self.engine.search(&self.game, self.search_options(go)?)?;
             }
             Command::Stop => {
                 self.engine.stop();
             }
             Command::NewGame => {
-                self.engine.reset();
+                self.engine.reset()?;
             }
             Command::Eval => {
                 self.show_eval()?;
@@ -157,7 +157,7 @@ impl Uci {
         options.moves_to_search = go
             .moves_to_search
             .into_iter()
-            .map(|mv| mv.to_move(&position))
+            .map(|mv| mv.to_move(position))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(options)
@@ -169,7 +169,7 @@ impl Uci {
             "Use NNUE" => self.engine.set_eval_mode(EvalMode::Psqt),
             "Threads" => self.engine.set_thread_count(option_as_u32(value)?)?,
             "Hash" => self.engine.resize_cache(option_as_usize(value)?)?,
-            "Clear Hash" => self.engine.reset(),
+            "Clear Hash" => self.engine.clear_cache(),
             _ => return Err(anyhow::Error::msg(format!("invalid option '{}'", name))),
         }
         Ok(())
@@ -177,17 +177,17 @@ impl Uci {
 }
 
 fn option_as_u32(value: Option<&str>) -> anyhow::Result<u32> {
-    Ok(value
+    value
         .context("expected integer value")?
         .parse()
-        .context("invalid value, expected integer")?)
+        .context("invalid value, expected integer")
 }
 
 fn option_as_usize(value: Option<&str>) -> anyhow::Result<usize> {
-    Ok(value
+    value
         .context("expected integer value")?
         .parse()
-        .context("invalid value, expected integer")?)
+        .context("invalid value, expected integer")
 }
 
 fn option_as_bool(value: Option<&str>) -> anyhow::Result<bool> {
