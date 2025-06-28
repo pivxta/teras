@@ -12,6 +12,6 @@ opt-level = 3
 
 [dependencies]
 teras_engine = { path = "../engine" }
-dama = { path = "../../dama" }
+dama = "0.1.0"
 anyhow = "1.0.98"
 thiserror = "2.0.12"

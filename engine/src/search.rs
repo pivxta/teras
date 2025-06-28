@@ -191,7 +191,7 @@ impl Default for Shared {
 
 enum Job {
     Reset,
-    Search(SearchJob),
+    Search(Box<SearchJob>),
 }
 
 struct SearchJob {
@@ -335,7 +335,7 @@ impl Engine {
         moves_to_search.retain(|mv| game.position().is_legal(mv));
 
         for (_, jobs) in &self.threads {
-            jobs.send(Job::Search(SearchJob {
+            jobs.send(Job::Search(Box::new(SearchJob {
                 game: game.clone(),
                 cache: self.cache.clone(),
                 shared: self.shared.clone(),
@@ -351,7 +351,7 @@ impl Engine {
 
                 on_depth_finished: options.on_depth_finished.take(),
                 on_search_finished: options.on_search_finished.take(),
-            }))
+            })))
             .expect("search thread terminated before expected");
         }
 
@@ -461,7 +461,7 @@ impl Thread {
 
     fn do_job(&mut self, job: Job) {
         match job {
-            Job::Search(job) => self.do_search_job(job),
+            Job::Search(job) => self.do_search_job(*job),
             Job::Reset => self.reset(),
         }
     }
@@ -538,7 +538,7 @@ impl Thread {
                 };
 
                 if let Some(send_info) = &mut on_depth_finished {
-                    send_info(&game.position(), self.search_info(depth, eval, bound, &pv));
+                    send_info(game.position(), self.search_info(depth, eval, bound, &pv));
                 }
 
                 last_depth = depth;
@@ -567,7 +567,7 @@ impl Thread {
 
         if let Some(on_search_finished) = on_search_finished {
             on_search_finished(
-                &game.position(),
+                game.position(),
                 self.search_info(
                     last_depth, 
                     last_eval.unwrap_or(Eval::ZERO), 
@@ -590,7 +590,7 @@ impl Thread {
             nodes_searched,
             nodes_per_sec,
             time_elapsed,
-            hash_full_permill: 0,
+            hash_full_permill: self.cache.used_approx_permill(),
         }
     }
 
@@ -661,7 +661,6 @@ impl Thread {
             if !in_check
                 && node.depth >= 2 
                 && node.is_cut() 
-                && static_eval >= window.beta
                 && game.position().has_non_pawn_material(game.position().side_to_move())
             {
                 let reduction = 2 + node.depth / 5;
@@ -684,8 +683,11 @@ impl Thread {
         }
 
         let mut sub_line = Line::new();
+
         let mut quiets = MoveList::new();
         let mut quiets_tried = 0;
+        let mut skip_quiets = false;
+
         let moves = OrderedMoves::new(
             self.ordering_context(game, &node, hash_move),
             if node.is_root() {
@@ -707,11 +709,17 @@ impl Thread {
         for (n, mv) in moves.enumerate() {
             let is_quiet = game.position().is_quiet(&mv);
 
-            if is_quiet
-                && !node.is_pv() 
-                && node.depth <= 2 
+            if is_quiet && skip_quiets {
+                continue;
+            }
+
+            if !node.is_pv()
+                && node.depth <= 2
+                && !skip_quiets
+                && is_quiet
                 && quiets_tried >= 5 + node.depth * node.depth 
             {
+                skip_quiets = true;
                 continue;    
             }
 
@@ -781,7 +789,7 @@ impl Thread {
             if eval > best_eval {
                 best_move = Some(mv);
                 best_eval = eval;
-                if node.is_pv() && child_node.is_pv() {
+                if (node.is_root() || best_eval > window.alpha) && node.is_pv() && child_node.is_pv() {
                     pv.set(mv, &sub_line);
                 }
                 if best_eval > window.alpha {

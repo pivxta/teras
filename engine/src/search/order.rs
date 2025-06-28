@@ -61,7 +61,7 @@ impl OrderedMoves {
         } else if ctx.killers.contains(&mv) {
             KILLER_MOVE
         } else {
-            QUIET_MOVE + ctx.history.get(&position, &mv)
+            QUIET_MOVE + ctx.history.get(position, &mv)
         }
     }
 

@@ -81,7 +81,7 @@ impl Game {
 
     #[inline]
     pub fn visit<T>(&mut self, mv: &Move, mut f: impl FnMut(&mut Game) -> T) -> T {
-        self.play(&mv);
+        self.play(mv);
         let value = f(self);
         self.undo();
         value 
