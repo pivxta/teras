@@ -26,14 +26,6 @@ impl Line {
         let _ = self.0.try_extend_from_slice(&sub_line.0);
     }
 
-    pub fn first(&self) -> Option<Move> {
-        self.0.first().cloned()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub fn to_vec(&self) -> Vec<Move> {
         self.0.to_vec()
     }

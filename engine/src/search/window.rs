@@ -24,11 +24,6 @@ impl Window {
     }
 
     #[inline]
-    pub fn contains(&self, eval: Eval) -> bool {
-        eval > self.alpha && eval < self.beta
-    }
-
-    #[inline]
     pub fn null_alpha(&mut self) -> Self {
         Self {
             alpha: self.alpha,

@@ -43,6 +43,7 @@ impl Uci {
         match command {
             Command::Uci => {
                 self.id();
+                self.show_options(); 
                 self.uci_ok();
             }
             Command::IsReady => {
@@ -174,6 +175,14 @@ impl Uci {
         }
         Ok(())
     }
+
+    fn show_options(&self) {
+        println!("option name Use NNUE type check default true");
+        println!("option name Threads type spin default 1 min 1 max 1048576");
+        println!("option name Hash type spin default 16 min 1 max 1048576");
+        println!("option name Clear Hash type button");
+    }
+
 }
 
 fn option_as_u32(value: Option<&str>) -> anyhow::Result<u32> {
